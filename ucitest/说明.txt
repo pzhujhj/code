@@ -1,0 +1,8 @@
+1、例子通过向文件中写入数据结果
+root@www:~# cat /var/state/myuci 
+myuci.enable=aaaa
+myuci.test.id=5
+myuci.ret.id=5
+
+2、如果是写入myuci.enable的数据，只需要建立一个空文件 /etc/config/myuci
+3、如果需要写入myuci.test.id的数据，那么需要在/etc/config/myuci文件中添加 config 'myuci' 'test'
