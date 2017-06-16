@@ -1,0 +1,1879 @@
+#include <sys/types.h>
+#include <fcntl.h>
+#include <math.h>
+#include <time.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <termios.h>
+#include <signal.h>
+#include <syslog.h>
+#include <stdarg.h>
+#include <uci.h>
+#include <math.h>
+
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
+#include <sys/ioctl.h>
+#include <libubox/uloop.h>
+#include <libubox/kvlist.h>
+#include <libubox/blobmsg.h>
+#include <libubox/blobmsg_json.h>
+#include <libubus.h>
+
+#include "bdgpsd.h"
+
+#define _unused __attribute__((unused))
+
+static struct ubus_context *gps_ubus_ctx = NULL;
+static struct ubus_auto_conn conn;
+struct blob_buf b;
+struct uloop_timeout gps_operate_timer;
+
+#define LOG_TAG "GPS"
+#define GPS_BUFSZ 2048
+#define GPS_SV_NR_MAX 32
+
+#define MAX_NMEA_SENTENCE 84
+//#define MAX_NMEA_PARAM	20
+#define MAX_NMEA_PARAM	32
+#define MAX_BUF_SIZE 2048
+
+#define ARRAY_MSG_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+#define DD(s) ((int)((s)[0]-'0')*10+(int)((s)[1]-'0'))
+
+#define FILE_MAX_SIZE (1024*1024) //1M
+#define PI 3.14159265358979323846
+
+enum {
+	GPS_SER_CLOSE,
+	GPS_SER_OPEN,
+	GPS_LOG_OPEN,
+	GPS_LOG_CLOSE
+};
+
+enum {
+	ANTENNA_OK,
+	ANTENNA_OPEN,
+	ANTENNA_SHORT,
+	ANTENNA_UNKNOWN
+};
+
+enum {
+	GNSS,
+	GPS,
+	BDS
+};
+
+struct gps_buf {
+	char *tail;
+	char *end;
+	char *data;
+	char *head;
+};
+
+struct gps_satellite {
+	int svid;
+	int elevation;
+	int azimuth;
+	int snr;
+};
+
+struct nmea_param {
+	char *str;
+	int num;
+} nmea_params[MAX_NMEA_PARAM];
+
+const char *devctl = NULL;
+static int gps_fd = -1;
+static FILE *gps_fp = NULL;
+static int set_time = 0;
+static time_t time_set = 0;
+static int tz = 0;
+static float olat = 0.0;
+static float olon = 0.0;
+static int gps_status = 0;
+static int gps_ant = ANTENNA_OPEN;
+static int gps_mode = GNSS;
+
+static int gps_valid = 0;
+static int signal_total[128];
+static int sate_gps_use = 0;
+static int sate_bd_use = 0;
+static int signal_num = 0;
+/*
+   static int gps_sv_nr = 0;
+   static struct gps_satellite gps_svs[GPS_SV_NR_MAX];
+   */
+static int verbose = 0;
+static int use_syslog = 0;
+#ifdef HAVE_GPS_LED
+static int led_status = 0;
+#endif
+static int work_mode = 0;
+static struct termios tiosfd;
+static struct uci_context *ctx = NULL;
+static struct uci_ptr ptr;
+
+static int uci_revert_state(struct uci_context *ctx, char *str);
+static int uci_set_state(struct uci_context *ctx, char *str);
+static struct gps_buf *gbuf = NULL;
+static int stand_flag = 0;
+
+static int offset = 0;
+static int tmp = 0;
+
+static GPSLOG gpslog;
+GPS_MSG gps_msg;
+
+static struct uloop_fd gps_ubus_fd = {
+	.fd = 0,
+};
+
+static struct comm {
+	char command[12];
+}comms[] = {
+	{
+		.command = {0x23, 0x3E, 0x03, 0x51, 0x04, 0x00, 0x03, 0x04, 0x01, 0x01, 0x61, 0x82},   //open rmc
+	},{
+		.command = {0x23, 0x3E, 0x03, 0x51, 0x04, 0x00, 0x04, 0x04, 0x01, 0x01, 0x62, 0x86},    //open gga
+	},{
+		.command = {0x23, 0x3E, 0x03, 0x51, 0x04, 0x00, 0x05, 0x04, 0x01, 0x01, 0x63, 0x8A},    //open gsa
+	},{
+		.command = {0x23, 0x3E, 0x03, 0x51, 0x04, 0x00, 0x06, 0x04, 0x01, 0x01, 0x64, 0x8E},    //open gsv
+	}
+};
+
+static void glog(int priority, const char *format, ...)
+{
+	va_list ap;
+	FILE *stream;
+
+	if (priority == LOG_DEBUG && verbose < 2)
+		return;
+
+	if (priority == LOG_INFO && verbose < 1)
+		return;
+
+	va_start(ap, format);
+	if (use_syslog)
+		vsyslog(priority, format, ap);
+	else {
+		if (priority == LOG_ERR)
+			stream = stderr;
+		else
+			stream = stdout;
+
+		vfprintf(stream, format, ap);
+	}
+	va_end(ap);
+}
+
+#ifdef HAVE_GPS_LED
+#define GPS_LED "/sys/class/leds/GPS/brightness"
+static int led_gps(int on)
+{
+	int fd;
+
+	if (on == led_status)
+		return 0;
+
+	led_status = on;
+
+	fd = open(GPS_LED, O_WRONLY);
+	if (fd < 0)
+		return -1;
+
+	write(fd, on ? "1" : "0", 1);
+	close(fd);
+
+	return 0;
+}
+#endif
+
+static struct gps_buf *gps_buf_alloc(size_t size)
+{
+	struct gps_buf *buf = calloc(1, sizeof(*buf) + size);
+	if (buf == NULL)
+		return NULL;
+
+	buf->head = (char *)buf + sizeof(*buf);
+	buf->end  = buf->head + size;
+	buf->data = buf->tail = buf->head;
+
+	return buf;
+}
+
+static void gps_buf_free(struct gps_buf *buf)
+{
+	free(buf);
+}
+
+/* set system date and time */
+static int set_date(struct tm *date)
+{
+	struct tm now;
+	time_t t1, t2;
+
+	t1 = time(NULL);
+	if (t1 < 0) {
+		glog(LOG_ERR, "Can not get current time");
+		return -1;
+	}
+
+	memcpy(&now, localtime(&t1), sizeof(now));
+
+	now.tm_sec = date->tm_sec;
+	now.tm_min = date->tm_min;
+	//now.tm_hour = date->tm_hour + (-timezone) / 3600;
+	now.tm_hour = date->tm_hour;
+	now.tm_mday = date->tm_mday;
+	now.tm_mon = date->tm_mon;
+	now.tm_year = date->tm_year;
+
+	t2 = mktime(&now);
+	if (t2 < 0) {
+		glog(LOG_ERR, "Can not mktime");
+		return -1;
+	}
+
+	if (tz != timezone) { // in case of timezone changed
+		t2 += (-timezone); // add timezone only first time
+		tz = -timezone;
+	}
+
+	if (t2 - t1 >= 10) { // time difference more than 10 secs
+		if (stime(&t2) < 0) {
+			glog(LOG_ERR, "Can not set time");
+			return -1;
+		}
+		time_set = t2; // record last time we set
+	}
+
+	return 0;
+}
+
+static int gps_ubus_send(const char *type, struct blob_attr *data)
+{
+	if (!gps_ubus_ctx || !type || !data) {
+		return -1;
+	}
+	return ubus_send_event(gps_ubus_ctx, type, data);
+}
+
+static void nmea_rmc_cb(char *msg ,char *buff)
+{
+	struct tm tm;
+//	time_t time;
+	char tmp[256];
+	char str[64] = {0};
+	int flag = 0;
+
+	sprintf(str, "%s", "gps.position.status");
+	if (uci_revert_state(ctx, str) < 0)
+		return;
+
+	sprintf(str, "gps.position.status=%s", nmea_params[2].str);
+	if (uci_set_state(ctx, str) < 0)
+		return;
+
+	snprintf(gps_msg.status, sizeof(gps_msg.status), "%s", nmea_params[2].str);
+
+	//get state work mode
+	if (!strcmp("GNRMC", msg))
+		gps_mode = GNSS;
+	else if (!strcmp("BDRMC", msg))
+		gps_mode = BDS;
+	else if (!strcmp("GPRMC", msg))
+		gps_mode = GPS;
+
+	sprintf(str, "%s", "gps.position.mode");
+	if (uci_revert_state(ctx, str) < 0)
+		return;
+
+	sprintf(str, "gps.position.mode=%d", gps_mode);
+	if (uci_set_state(ctx, str) < 0)
+		return;
+
+	//check locate status
+	blob_buf_init(&b, 0);
+	if ((!strcmp("A", nmea_params[2].str))) {
+		blobmsg_add_string(&b, "status", "A");
+		flag = 1;
+	}else if((!strcmp("V", nmea_params[2].str))){
+		blobmsg_add_string(&b, "status", "V");
+		flag = 0;
+	}
+
+	if (gps_status != flag) {
+		gps_ubus_send("gps_status", b.head);
+		gps_status = flag;
+	}
+
+	if (*nmea_params[2].str != 'A') {
+		memset(&gps_msg, 0, sizeof(GPS_MSG));
+		memcpy(gps_msg.status, "V", 1);
+		gps_valid = 0;
+		return;
+	}
+
+	if (!nmea_params[1].str[0])
+		return;
+
+	gps_valid = 1;
+	memset(&tm, 0, sizeof(tm));
+	tm.tm_isdst = 1;
+
+	tm.tm_hour = DD(nmea_params[1].str);
+	tm.tm_min  = DD(nmea_params[1].str + 2);
+	tm.tm_sec  = DD(nmea_params[1].str + 4);
+
+	tm.tm_mday = DD(nmea_params[9].str);
+	tm.tm_mon  = DD(nmea_params[9].str + 2) - 1;
+	tm.tm_year = DD(nmea_params[9].str + 4) + 100;
+
+	strftime(tmp, 256, "%F %T", &tm);
+	glog(LOG_INFO, "date: %s UTC\n", tmp);
+
+	if (set_time && time_set == 0)
+		set_date(&tm);
+
+	if (!nmea_params[3].str[0] || !nmea_params[5].str[0])
+		return;
+
+	char longitude[32], latitude[32];
+	double lat, lon;
+	double d, m;
+//	float lat, lon;
+//	float d, m;
+	float speed = 0, course = 0;
+	int speed_valid = 0;
+//	int course_valid = 0;
+
+	if (nmea_params[7].str[0] && strcmp(nmea_params[7].str, "NaN")) {
+		speed = atof(nmea_params[7].str); //knots
+		speed *= 1.852; // Km/h
+		speed_valid = 1;
+	}
+
+	if (nmea_params[8].str[0] && strcmp(nmea_params[8].str, "NaN")) {
+		course = atof(nmea_params[8].str);
+		//course_valid = 1;
+	}
+
+	lat = atof(nmea_params[3].str);
+	m = 100.0 * modf(lat / 100.0, &d);
+	//m = 100.0 * modff(lat / 100.0, &d);
+	lat = d + m / 60.0;
+	if (*nmea_params[4].str == 'S')
+		lat = -lat;
+
+	lon = atof(nmea_params[5].str);
+	m = 100.0 * modf(lon / 100.0, &d);
+	//m = 100.0 * modff(lon / 100.0, &d);
+	lon = d + m / 60.0;
+	if (*nmea_params[6].str == 'W')
+		lon = -lon;
+
+	snprintf(latitude, sizeof(latitude), "%.6f", lat);
+	snprintf(longitude, sizeof(longitude), "%.6f", lon);
+	glog(LOG_INFO, "position: %s %s\n", latitude, longitude);
+
+//	if (fabs(olat - lat) >= 1e-6 || fabs(olon - lon) >= 1e-6) {
+		sprintf(str, "%s", "gps.position");
+		if (uci_revert_state(ctx, str) < 0)
+			return;
+
+		sprintf(str, "gps.position.lat=%s", latitude);
+		if (uci_set_state(ctx, str) < 0)
+			return;
+		snprintf(gps_msg.latitude, sizeof(gps_msg.latitude), "%s", latitude);
+
+		sprintf(str, "gps.position.latdirection=%s", nmea_params[4].str);
+		if (uci_set_state(ctx, str) < 0)
+			return;
+
+		snprintf(gps_msg.latdirection, sizeof(gps_msg.latdirection), "%s", nmea_params[4].str);
+
+		sprintf(str, "gps.position.lon=%s", longitude);
+		if (uci_set_state(ctx, str) < 0)
+			return;
+		snprintf(gps_msg.longitude, sizeof(gps_msg.longitude), "%s", longitude);
+
+		sprintf(str, "gps.position.londirection=%s", nmea_params[6].str);
+		if (uci_set_state(ctx, str) < 0)
+			return;
+		snprintf(gps_msg.londirection, sizeof(gps_msg.londirection), "%s", nmea_params[6].str);
+
+		olat = lat;
+		olon = lon;
+//	}
+
+//	time = mktime(&tm);
+//	time -= timezone;
+//	localtime_r(&time, &tm);
+
+	sprintf(str, "%s", "gps.position.date");
+	if (uci_revert_state(ctx, str) < 0)
+		return;
+
+	strftime(tmp, 256, "%F %T", &tm);
+	sprintf(str, "gps.position.date=%s", tmp);
+	if (uci_set_state(ctx, str) < 0)
+		return;
+	snprintf(gps_msg.time, sizeof(gps_msg.time), "%s", tmp);
+
+	//对地速度，单位节*1.852=公里
+	if (speed_valid) {
+		sprintf(str, "%s", "gps.position.sog");
+		if (uci_revert_state(ctx, str) < 0)
+			return;
+
+		sprintf(str, "gps.position.sog=%.1f", speed);
+		if (uci_set_state(ctx, str) < 0)
+			return;
+
+		snprintf(gps_msg.speed, sizeof(gps_msg.speed), "%.1f", speed);
+	}
+
+	//对地真航向,单位度
+//	if (course_valid) {
+	sprintf(str, "%s", "gps.position.cog");
+	if (uci_revert_state(ctx, str) < 0)
+		return;
+
+	sprintf(str, "gps.position.cog=%.1f", course);
+	if (uci_set_state(ctx, str) < 0)
+		return;
+
+	snprintf(gps_msg.cog, sizeof(gps_msg.cog), "%.1f", course);
+//	}
+
+#ifdef HAVE_GPS_LED
+	led_gps(1);
+#endif
+}
+
+static void nmea_gga_cb(char *msg, char *buff)
+{
+	char elivation[16];
+	char str[64] = {0};
+	int gps_sv_nr = 0;
+	float eli;
+
+	if (!gps_valid)
+		return;
+
+	//海拔高度
+	sprintf(str, "%s", "gps.position.height");
+	if (uci_revert_state(ctx, str) < 0)
+		return;
+
+	strncpy(elivation, nmea_params[9].str, sizeof(elivation));
+	sprintf(str, "gps.position.height=%s", elivation);
+	if (uci_set_state(ctx, str) < 0)
+		return;
+
+	eli = atof(nmea_params[9].str);
+	snprintf(gps_msg.elevation, sizeof(gps_msg.elevation), "%.1f", eli);
+	//memcpy(gps_msg.elevation, elivation, strlen(elivation));
+
+	//使用卫星数
+	gps_sv_nr = nmea_params[7].num;
+	sprintf(str, "%s", "gps.position.count");
+	if (uci_revert_state(ctx, str) < 0)
+		return;
+
+	sprintf(str, "gps.position.count=%d", gps_sv_nr);
+	if (uci_set_state(ctx, str) < 0)
+		return;
+
+	gps_msg.satellites_count = gps_sv_nr;
+}
+
+#if 0
+	static void
+nmea_vtg_cb(void)
+{
+	char str[64];
+	float course = 0.0;
+	float speed = 0.0;
+	int course_valid = 0;
+	int speed_valid  = 0;
+
+	if (!gps_valid)
+		return;
+
+	if (nmea_params[1].str[0] && nmea_params[2].str[0] == 'T'
+			&& strcmp(nmea_params[1].str, "NaN")) {
+		course_valid = 1;
+		course = atof(nmea_params[1].str);
+
+		sprintf(str, "%s", "gps.position.cog");
+		if (uci_revert_state(ctx, str) < 0)
+			return;
+
+		sprintf(str, "gps.position.cog=%.1f", course);
+		if (uci_set_state(ctx, str) < 0)
+			return;
+	}
+
+	if (nmea_params[7].str[0] && nmea_params[8].str[0] == 'K'
+			&& strcmp(nmea_params[7].str, "NaN")) {
+		speed_valid = 1;
+		speed = atof(nmea_params[7].str);
+
+		sprintf(str, "%s", "gps.position.sog");
+		if (uci_revert_state(ctx, str) < 0)
+			return;
+
+		sprintf(str, "gps.position.sog=%.1f", speed);
+		if (uci_set_state(ctx, str) < 0)
+			return;
+	}
+
+	if (course_valid || speed_valid)
+		glog(LOG_INFO, "course: %.1f, speed: %.1f Km/h\n", course, speed);
+}
+#endif
+
+static void  find_signal_data(int *value, int length, int *total)
+{
+	int line, i;
+
+	for (i = 0; i < NMEA_MAXSAT; i++) {
+		for (line = 0; line < length; line++) {
+			if (gps_msg.nmeagsv.sat_data[line].id == value[i]) {
+				total[signal_num++] = gps_msg.nmeagsv.sat_data[line].sig;
+				break;
+			}
+		}
+	}
+
+	if (signal_num > sizeof(signal_total)/sizeof(int))
+		signal_num = 0;
+}
+
+static void nmea_gsv_cb(char *msg, char *buff)
+{
+	char str[64];
+	int count;
+	int ave_signal = 0;
+	int sum = 0;
+	int isat, isi, nsat;
+	int flag = 0;
+//	int angle = 0;
+
+//	if (!gps_valid)
+//		return;
+
+	//当前可见卫星数
+	if ((!strcmp(nmea_params[2].str, "1")) &&  !strcmp("GPGSV", msg))
+		gps_msg.gp_vis_sate = nmea_params[3].num;
+
+	if ((!strcmp(nmea_params[2].str, "1")) &&  !strcmp("BDGSV", msg))
+		gps_msg.bd_vis_sate = nmea_params[3].num;
+
+	sprintf(str, "%s", "gps.position.visate");
+	if (uci_revert_state(ctx, str) < 0)
+		return;
+
+	sprintf(str, "gps.position.visate=%d", (gps_msg.gp_vis_sate+gps_msg.bd_vis_sate));
+	if (uci_set_state(ctx, str) < 0)
+		return;
+
+	gps_msg.visible_satellite = (gps_msg.gp_vis_sate+gps_msg.bd_vis_sate);
+
+	//处理每一条gsv数据,获取每一个可见卫星的信号值
+	gps_msg.nmeagsv.pack_count = nmea_params[1].num;
+	gps_msg.nmeagsv.pack_index = nmea_params[2].num;
+	gps_msg.nmeagsv.sat_count = nmea_params[3].num;
+	nsat = (gps_msg.nmeagsv.pack_index - 1) * NMEA_SATINPACK;
+	nsat = (nsat + NMEA_SATINPACK > gps_msg.nmeagsv.sat_count)?(gps_msg.nmeagsv.sat_count - nsat):NMEA_SATINPACK;
+
+	if (gps_msg.satellites_count >= 3) {
+		if (!strcmp("GPGSV", msg)) {
+			for(isat = 0; isat < nsat; ++isat) {
+				isi = (gps_msg.nmeagsv.pack_index - 1) * NMEA_SATINPACK + isat;
+				gps_msg.nmeagsv.sat_data[isi].id = nmea_params[isat*NMEA_SATINPACK+4].num;
+				gps_msg.nmeagsv.sat_data[isi].elv = nmea_params[isat*NMEA_SATINPACK+5].num;
+				gps_msg.nmeagsv.sat_data[isi].azimuth = nmea_params[isat*NMEA_SATINPACK+6].num;
+				gps_msg.nmeagsv.sat_data[isi].sig = nmea_params[isat*NMEA_SATINPACK+7].num;
+
+				if (isi == (gps_msg.nmeagsv.sat_count-1))
+					flag = 1;
+			}
+
+			if (flag == 1) {
+				find_signal_data(gps_msg.sate_gps_id, gps_msg.nmeagsv.sat_count, signal_total);
+				memset(&gps_msg.nmeagsv, 0, sizeof(gps_msg.nmeagsv));
+			}
+		}else if (!strcmp("BDGSV", msg)){
+			for(isat = 0; isat < nsat; ++isat) {
+				isi = (gps_msg.nmeagsv.pack_index - 1) * NMEA_SATINPACK + isat;
+				gps_msg.nmeagsv.sat_data[isi].id = nmea_params[isat*NMEA_SATINPACK+4].num;
+				gps_msg.nmeagsv.sat_data[isi].elv = nmea_params[isat*NMEA_SATINPACK+5].num;
+				gps_msg.nmeagsv.sat_data[isi].azimuth = nmea_params[isat*NMEA_SATINPACK+6].num;
+				gps_msg.nmeagsv.sat_data[isi].sig = nmea_params[isat*NMEA_SATINPACK+7].num;
+
+				if (isi == (gps_msg.nmeagsv.sat_count-1))
+					flag = 1;
+			}
+
+			if (flag == 1) {
+				find_signal_data(gps_msg.sate_bd_id, gps_msg.nmeagsv.sat_count, signal_total);
+				memset(&gps_msg.nmeagsv, 0, sizeof(gps_msg.nmeagsv));
+			}
+		}
+
+		if (signal_num > gps_msg.satellites_count)
+			signal_num = gps_msg.satellites_count;
+
+		if (signal_num == gps_msg.satellites_count) {
+			for (count = 0; count < signal_num; count++) {
+				sum += signal_total[count];
+			}
+
+			if (count == signal_num) {
+				ave_signal = sum/signal_num;
+				signal_num = 0;
+
+				memset(gps_msg.sate_gps_id, 0, sizeof(gps_msg.sate_gps_id));
+				memset(gps_msg.sate_bd_id, 0, sizeof(gps_msg.sate_bd_id));
+				memset(signal_total, 0, sizeof(signal_total));
+			}
+
+			gps_msg.ave_signal = ave_signal;
+			glog(LOG_INFO, "time=%s\n", gps_msg.time);
+			glog(LOG_INFO, "ave_signal=%d\n", ave_signal);
+		}
+	}else {
+		memset(&gps_msg.nmeagsv, 0, sizeof(gps_msg.nmeagsv));
+	}
+
+#if 0
+	//真方位角
+	angle = nmea_params[6].num;
+	if ((!strcmp(nmea_params[2].str, "1")) &&  !strcmp("GPGSV", msg)) {
+		sprintf(str, "%s", "gps.position.angle");
+		if (uci_revert_state(ctx, str) < 0)
+			return;
+
+		sprintf(str, "gps.position.angle=%d", angle);
+		if (uci_set_state(ctx, str) < 0)
+			return;
+
+		memset(str, 0, sizeof(str));
+
+		sprintf(str, "%d", angle);
+		memcpy(gps_msg.angle, str, strlen(str));
+	}
+#endif
+}
+
+static void nmea_txt_cb(char *msg, char *buff)
+{
+	char str[64] = {0};
+
+	memset(str, 0, sizeof(str));
+	sprintf(str, "%s", "gps.position.antenna");
+	if (uci_revert_state(ctx, str) < 0)
+		return;
+
+	if (!strcmp("ANTENNA OPEN", nmea_params[4].str)) {
+		sprintf(str, "gps.position.antenna=%s", "1");
+		gps_ant = ANTENNA_OPEN;
+	}else if (!strcmp("ANTENNA SHORT", nmea_params[4].str)) {
+		sprintf(str, "gps.position.antenna=%s", "2");
+		gps_ant = ANTENNA_SHORT;
+	}
+	else if (!strcmp("ANTENNA OK", nmea_params[4].str)) {
+		sprintf(str, "gps.position.antenna=%s", "0");
+		gps_ant = ANTENNA_OK;
+	}
+	else if (!strcmp("ANTENNA UNKNOWN", nmea_params[4].str)) {
+		sprintf(str, "gps.position.antenna=%s", "3");
+		gps_ant = ANTENNA_UNKNOWN;
+	}
+
+	if (uci_set_state(ctx, str) < 0)
+		return;
+}
+
+static void nmea_gsa_cb(char *msg, char *buff)
+{
+	int line;
+	char *sysid = NULL;
+
+	//模式1:定位不可用
+	if ((nmea_params[2].num == 1) || (gps_msg.satellites_count == 0))
+		return;
+
+	//判断系统标识符
+	sysid = strrchr(buff, ',');
+
+	//收集正在使用卫星的标志号,根据gsa数据报文中使用卫星的标志号最多为12个
+	for(line = 3; line < NMEA_MAXSAT+3; line++) {
+		if (nmea_params[line].num == 0)
+			break;
+		else {
+			if (sysid[1] == '1')   //gps gsa
+				gps_msg.sate_gps_id[sate_gps_use++] = nmea_params[line].num;
+			else if (sysid[1] == '4') //bd gsa
+				gps_msg.sate_bd_id[sate_bd_use++] = nmea_params[line].num;
+		}
+	}
+
+	if ((sate_gps_use+sate_bd_use) >= gps_msg.satellites_count) {
+		sate_gps_use = 0;
+		sate_bd_use = 0;
+	}
+}
+
+static struct nmea_msg {
+	char *msg;
+	int cnt;
+	void (*handler) (char *mssage, char *buff);
+} nmea_msgs[] = {
+	{
+		.msg = "RMC",
+		.cnt = 14,
+		.handler = nmea_rmc_cb,
+		/*	}, {
+			.msg = "VTG",
+			.cnt = 9,
+			.handler = nmea_vtg_cb,
+			*/
+	}, {
+		.msg = "GGA",
+		.cnt = 15,
+		.handler = nmea_gga_cb,
+	}, {
+		.msg = "GSV",
+		.cnt = 21,
+		.handler = nmea_gsv_cb,
+	}, {
+		.msg = "TXT",
+		.cnt = 5,
+		.handler = nmea_txt_cb,
+	}, {
+		.msg = "GSA",
+		.cnt = 19,
+		.handler = nmea_gsa_cb,
+	}
+};
+
+static int
+nmea_verify_checksum(char *s)
+{
+	char *csum = strrchr(s, '*');
+	int isum, c = 0;
+
+	if (!csum)
+		return -1;
+
+	*csum = '\0';
+	csum++;
+	isum = strtol(csum, NULL, 16);
+
+	while(*s)
+		c ^= *s++;
+
+	if (isum != c)
+		return -1;
+
+	return 0;
+}
+
+static int
+nmea_tokenize(char *msg)
+{
+	int cnt = 0;
+	char *tok = msg;
+	char *ptr = tok;
+
+	while (*ptr != '\0' && cnt < MAX_NMEA_PARAM) {
+		if (*ptr == ',') {
+			*ptr = '\0';
+			nmea_params[cnt].str = tok;
+			nmea_params[cnt].num = atoi(tok);
+			tok = ptr + 1;
+			cnt++;
+		}
+		ptr++;
+	}
+
+	if (*ptr == '\0' && tok <= ptr) {
+		nmea_params[cnt].str = tok;
+		nmea_params[cnt].num = atoi(tok);
+		cnt++;
+	}
+
+	return cnt;
+}
+
+static void
+nmea_process(char *msg)
+{
+	char *csum;
+	char buf[120] = {0};
+	int cnt, i;
+
+	memset(buf, 0, sizeof(buf));
+	memcpy(buf, msg, strlen(msg));
+
+	if (strncmp(msg, "$GP", 3) && strncmp(msg, "$GN", 3) && strncmp(msg, "$BD", 3))
+		return;
+
+	msg++;
+	csum = strrchr(msg, '*');
+	if (!csum)
+		return;
+
+	if (nmea_verify_checksum(msg)) {
+		glog(LOG_DEBUG, "nmea message has invlid checksum\n");
+		return;
+	}
+
+	cnt = nmea_tokenize(&msg[2]);
+	if (cnt < 0) {
+		glog(LOG_NOTICE, "failed to tokenize %s\n", msg);
+		return;
+	}
+
+	for (i = 0; i < ARRAY_MSG_SIZE(nmea_msgs); i++) {
+		if (strcmp(nmea_params[0].str, nmea_msgs[i].msg))
+			continue;
+		if (nmea_msgs[i].cnt >= cnt) {
+			nmea_msgs[i].handler(msg, buf);
+		}
+		else {
+			glog(LOG_NOTICE, "%s datagram has wrong parameter count got %d but expected %d\n",
+					nmea_msgs[i].msg, cnt, nmea_msgs[i].cnt);
+		}
+		return;
+	}
+}
+
+static int
+nmea_consume(char *s, const char *end)
+{
+	char *p = s;
+
+	if (work_mode == OTHER_TYPE) {
+		while (p < end && *p != '\n')
+			p++;
+	}else {
+		while (p < end && *p != '\r')
+			p++;
+	}
+
+	if (p == end) {
+		if (p - s >= MAX_NMEA_SENTENCE)
+			return p - s;
+		return -1;
+	}
+
+	*p++ = '\0';
+	if (p < end && *p == '\n')
+		*p++ = '\0';
+
+	while (p < end && (*p == '\r' || *p == '\n'))
+		*p++ = '\0';
+
+	if ((p - s > 2) && (p - s <= MAX_NMEA_SENTENCE)) {
+		//glog(LOG_DEBUG, "%s\n", s);
+		nmea_process(s);
+	}
+
+	return p - s;
+}
+
+static void nmea_msg_cb(struct gps_buf *buf)
+{
+	int ret;
+
+	while (buf->data < buf->tail) {
+		ret = nmea_consume(buf->data, buf->tail);
+		if (ret < 0 || ret > 84) {
+			//if (buf->tail == buf->end)
+			buf->data = buf->tail = buf->head;
+			break;
+		}
+
+		buf->data += ret;
+	}
+
+	if (buf->data == buf->tail) {
+		buf->data = buf->tail = buf->head;
+	}
+}
+
+static char read_i2c_page(int fd, char addr, char page)
+{
+	char byte = 0;
+	struct i2c_rdwr_ioctl_data i2c_data;
+
+	i2c_data.nmsgs = 2;
+	i2c_data.msgs = (struct i2c_msg*)malloc(i2c_data.nmsgs * sizeof(struct i2c_msg));
+	if (!i2c_data.msgs) {
+		glog(LOG_DEBUG, "i2c_data msgs malloc error!\n");
+		goto err;
+	}
+
+	i2c_data.msgs[0].len = 1;
+	i2c_data.msgs[0].addr = addr; // i2c 设备地址
+	i2c_data.msgs[0].flags = 0; //write
+	i2c_data.msgs[0].buf = (unsigned char*)malloc(1);
+	i2c_data.msgs[0].buf[0] = page; //i2c 数据地址
+
+	i2c_data.msgs[1].len = 1;
+	i2c_data.msgs[1].addr = addr; // i2c 设备地址
+	i2c_data.msgs[1].flags = I2C_M_RD; //read
+	i2c_data.msgs[1].buf = (unsigned char*)malloc(1);//存放返回值的地址。
+	i2c_data.msgs[1].buf[0] = 0; //初始化读缓冲
+
+	ioctl(fd,I2C_RDWR,(unsigned long)&i2c_data);
+
+	byte = i2c_data.msgs[1].buf[0];
+
+	free(i2c_data.msgs[0].buf);
+	free(i2c_data.msgs[1].buf);
+err:
+	free(i2c_data.msgs);
+
+	return byte;
+}
+
+int write_i2c_page(int fd, char addr, char reg, char *val, int len)
+{
+    int ret = 0;
+    struct i2c_rdwr_ioctl_data packets;
+    struct i2c_msg messages;
+    int i;
+
+    packets.nmsgs = 1;
+    packets.msgs = &messages;
+
+    //发送要读取的寄存器地址
+    messages.addr = addr;
+    messages.flags = 0;         //write
+    messages.len = len + 1;     //数据长度
+    //发送数据
+    messages.buf = (unsigned char *)malloc(len+1);
+    if (NULL == messages.buf)
+    {
+        ret = -1;
+        goto err;
+    }
+
+    messages.buf[0] = reg;
+    for (i = 0; i < len; i++)
+    {
+        messages.buf[1+i] = val[i];
+    }
+
+    ret = ioctl(fd, I2C_RDWR, (unsigned long)&packets);//读出来
+    if (ret < 0){
+        glog(LOG_DEBUG, "write error!\n");
+        return -1;
+    }
+
+err:
+    free(messages.buf);
+
+    return ret;
+}
+
+static void recv_call_reply(struct ubus_request *req, int type, struct blob_attr *msg)
+{
+	struct blob_attr **ret = (struct blob_attr **)req->priv;
+	if (ret != NULL) {
+		*ret = blob_memdup(msg);
+	}
+}
+
+static int ubus_call(const char *path, const char *method,
+		struct blob_attr *data, struct blob_attr **ret)
+{
+	int _ret = 0;
+	uint32_t id = 0;
+
+	if (gps_ubus_ctx == NULL) {
+		return -1;
+	}
+	_ret = ubus_lookup_id(gps_ubus_ctx, path, &id);
+	if (_ret) {
+		glog(LOG_ERR, "lookup ubus:%s error\n", path);
+		return -1;
+	}
+	return ubus_invoke(gps_ubus_ctx, id, method, data, recv_call_reply, ret, 500);
+}
+
+static void write_gps_log(FILE *fp, int max_size, char *buff, int buff_size)
+{
+	int length;
+
+	fseek(fp, 0, SEEK_END);
+	length = ftell(fp);
+
+	fwrite(buff, buff_size, 1, fp);
+	if (length > max_size) {
+		fclose(gpslog.gps_fp);
+		if (rename(gpslog.filename, gpslog.backfile)) {
+			remove(gpslog.backfile);
+			rename(gpslog.filename, gpslog.backfile);
+		}
+		gpslog.gps_fp = fopen(gpslog.filename, "at+");
+		if (NULL == gpslog.gps_fp)
+			glog(LOG_ERR, "fopen %s error!\n", gpslog.filename);
+	}
+}
+
+static void handle_gps_info(int status, char *msg, int len)
+{
+	switch(status) {
+		case GPS_SER_OPEN:
+			blob_buf_init(&b, 0);
+			blobmsg_add_string(&b, "type", "gps");
+			blobmsg_add_string(&b, "data", msg);
+			ubus_call("vdr", "set", b.head, NULL);
+			break;
+		case GPS_SER_CLOSE:
+			gpslog.status = GPS_LOG_CLOSE;
+			break;
+		case GPS_LOG_OPEN:
+			write_gps_log(gpslog.gps_fp, gpslog.filesize*FILE_MAX_SIZE, msg, len);
+			break;
+		default:
+			gpslog.status = GPS_LOG_CLOSE;
+			break;
+	}
+
+}
+
+static void gps_second_data(char *info, int count)
+{
+	FILE *rfp = NULL;
+
+	rfp = fopen(gps_msg.path, "w+");
+	if (NULL == rfp)
+		glog(LOG_ERR, "fopen error!\n");
+
+	fwrite(info, count, 1, rfp);
+
+	fclose(rfp);
+	rfp = NULL;
+	stand_flag = 0;
+}
+
+static int get_file_data(char *msg)
+{
+	char linebuf[128] = {0};
+	char buf[1024] = {0};
+	int ret = -1;
+	char ch;
+	int count = 0;
+
+	memset(linebuf, 0, 84);
+	memset(buf, 0, 1024);
+
+	while (!feof(gps_fp)) {
+		if((ch=fgetc(gps_fp)) == EOF) {
+			return 0;
+		}
+		fgets(linebuf, 84, gps_fp);
+		if(!strncmp(linebuf+2, "TXT", 3))
+			break;
+	}
+
+	offset = ftell(gps_fp);
+	fseek(gps_fp, tmp, SEEK_SET);
+	count = offset-tmp;
+	ret = fread(buf, count, 1, gps_fp);
+	if (ret == 0)
+		printf("fread error!\n");
+	tmp = offset;
+	fseek(gps_fp, tmp, SEEK_SET);
+
+	memcpy(msg, buf, count);
+
+	return count;
+}
+
+static int handle_nmea_msg(int fd, struct gps_buf *buf)
+{
+	int ret, i;
+	char byteh, bytel;
+	size_t count;
+	char loginfo[MAX_BUF_SIZE] = {0};
+	char value[1024] = {0}; 
+
+	for (;;) {
+		count = buf->end - buf->tail;
+		if (count == 0) {
+			nmea_msg_cb(buf);
+			continue;
+		}
+		do {
+			if (work_mode == UART_TYPE) {
+				ret = read(fd, buf->tail, count);
+			}
+			else if (work_mode == I2C_TYPE){
+				byteh = read_i2c_page(fd, GPS_SLAVE_ADDR, 0x80);
+				bytel = read_i2c_page(fd, GPS_SLAVE_ADDR, 0x81);
+
+				ret = byteh << 8 | bytel;
+				for (i = 0;i < ret; i++){
+					buf->tail[i] = read_i2c_page(fd, GPS_SLAVE_ADDR, 0x82);
+				}
+			}else {
+				memset(value, 0, 1024);
+				ret = get_file_data(value);	
+				memcpy(buf->tail, value, ret);
+				buf->tail[ret] = '\0';
+			}
+		} while (ret < 0 && errno == EINTR);
+
+		glog(LOG_DEBUG, "%s\n",buf->tail);
+	//	printf("%s\n", buf->tail);
+		memset(loginfo, 0, MAX_BUF_SIZE);
+		memcpy(loginfo, buf->tail, ret);
+		if (stand_flag == 1)
+			gps_second_data(loginfo, ret);
+		handle_gps_info(gpslog.status, loginfo, ret);
+
+		if (ret <= 0)
+			return ret;
+
+		buf->tail += ret;
+		nmea_msg_cb(buf);
+
+		if (ret < count)
+			break;
+	}
+
+	return ret;
+}
+
+static int main_loop(int fd)
+{
+	int ret;
+
+	ret = handle_nmea_msg(fd, gbuf);
+	if (ret < 0) {
+		glog(LOG_ERR, "Failed to read gps msg: %s\n", strerror(errno));
+	} else if (ret == 0) {
+		//glog(LOG_DEBUG, "read EOF on fd %d\n", fd);
+	}
+
+	return ret;
+}
+
+static int other_loop(FILE *fp)
+{
+	int ret;
+
+	ret = handle_nmea_msg(0, gbuf);
+	if (ret < 0) {
+		glog(LOG_ERR, "Failed to read gps msg: %s\n", strerror(errno));
+	} else if (ret == 0) {
+		//glog(LOG_DEBUG, "read EOF on fd %d\n", fd);
+	}
+
+	return ret;
+}
+
+static const char *uci_get_option(struct uci_context *ctx, const char *p, const char *s, const char *o)
+{
+	struct uci_element *e = NULL;
+	const char *value = NULL;
+
+	memset(&ptr, 0, sizeof(ptr));
+	ptr.package = p;
+	ptr.section = s;
+	ptr.option = o;
+
+	if (uci_lookup_ptr(ctx, &ptr, NULL, true) != UCI_OK) {
+		return NULL;
+	}
+	if (!(ptr.flags & UCI_LOOKUP_COMPLETE)) {
+		return NULL;
+	}
+	e = ptr.last;
+	if (e && e->type==UCI_TYPE_OPTION && ptr.o->type==UCI_TYPE_STRING)  {
+		value = ptr.o->v.string;
+	}
+	return value;
+}
+
+static int uci_revert_state(struct uci_context *c, char *str)
+{
+	struct uci_ptr ptr;
+
+	if (uci_lookup_ptr(c, &ptr, str, false) != UCI_OK){
+		uci_perror(c, LOG_TAG);
+		return -1;
+	}
+
+	if (uci_revert(c, &ptr) != UCI_OK) {
+		uci_perror(c, LOG_TAG);
+		return -1;
+	}
+
+	if (uci_save(c, ptr.p) != UCI_OK) {
+		uci_perror(c, LOG_TAG);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int uci_set_state(struct uci_context *c, char *str)
+{
+	struct uci_ptr ptr;
+
+	if (uci_lookup_ptr(c, &ptr, str, false) != UCI_OK){
+		uci_perror(c, LOG_TAG);
+		return -1;
+	}
+
+	if (uci_set(c, &ptr) != UCI_OK) {
+		uci_perror(c, LOG_TAG);
+		return -1;
+	}
+
+	if (uci_save(c, ptr.p) != UCI_OK) {
+		uci_perror(c, LOG_TAG);
+		return -1;
+	}
+
+	return 0;
+}
+
+static struct uci_context *uci_init()
+{
+	struct uci_context *c;
+
+	c = uci_alloc_context();
+	if (c == NULL) {
+		glog(LOG_ERR, "Out of memory");
+		return NULL;
+	}
+
+	uci_set_savedir(c, "/var/state");
+
+	return c;
+}
+
+static void handle_INT(int signum)
+{
+	glog(LOG_NOTICE, "Terminated by signal %d\n", signum);
+	tcsetattr(gps_fd, TCSAFLUSH, &tiosfd);
+	close(gps_fd);
+
+	if (ctx) {
+		uci_free_context(ctx);
+		ctx = NULL;
+	}
+
+	if (gpslog.gps_fp) {
+		fclose(gpslog.gps_fp);
+		gpslog.gps_fp = NULL;
+	}
+
+	if (gps_fp) {
+		fclose(gps_fp);
+		gps_fp = NULL;
+	}
+
+	if (gbuf)
+		gps_buf_free(gbuf);
+
+	if (use_syslog)
+		closelog();
+#ifdef HAVE_GPS_LED
+	led_gps(0);
+#endif
+	exit(1);
+}
+
+static void setup_signals()
+{
+	struct sigaction sa;
+
+	sa.sa_handler = handle_INT;
+	sa.sa_flags = 0;
+
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+}
+
+static void daemonize()
+{
+	int i;
+
+	daemon(0, 0);
+
+	for (i = 0; i < getdtablesize(); i++) {
+		if (close(i) < 0)
+			break;
+	}
+}
+
+static void destroy_all()
+{
+	uloop_done();
+	//	ubus_destory();
+}
+
+void add_gpsinfo_to_blob (struct blob_buf *buf)
+{
+	blobmsg_add_string(buf, "lat", gps_msg.latitude);
+	blobmsg_add_string(buf, "latd", gps_msg.latdirection);
+	blobmsg_add_string(buf, "lon", gps_msg.longitude);
+	blobmsg_add_string(buf, "lond", gps_msg.londirection);
+	blobmsg_add_string(buf, "time", gps_msg.time);
+	blobmsg_add_string(buf, "elv", gps_msg.elevation);
+	blobmsg_add_string(buf, "status", gps_msg.status);
+	blobmsg_add_u32(buf, "count", gps_msg.satellites_count);
+	blobmsg_add_u32(buf, "visate", gps_msg.visible_satellite);
+	blobmsg_add_u32(buf, "signal", gps_msg.ave_signal);
+	blobmsg_add_string(buf, "speed", gps_msg.speed);
+	blobmsg_add_string(buf, "cog", gps_msg.cog);
+	blobmsg_add_u32(buf, "mode", gps_mode);
+	if (work_mode == UART_TYPE)
+		blobmsg_add_u32(buf, "ant", gps_ant);
+}
+
+static double toradians(double degree)
+{
+	double r = degree*PI/180;
+	return r;
+}
+
+double getdistance(double lat1, double lon1, double lat2, double lon2)
+{
+	double a = 6378137, b = 6356752.314245, f = 1/298.257223563;
+	double L = toradians(lon2 - lon1);
+
+	double U1 = atan((1 - f)*tan(toradians(lat1)));
+	double U2 = atan((1 - f)*tan(toradians(lat2)));
+	double sinU1 = sin(U1), cosU1 = cos(U1);
+	double sinU2 = sin(U2), cosU2 = cos(U2);
+	double cosSqAlpha;
+	double sinSigma;
+	double cos2SigmaM;
+	double cosSigma;
+	double sigma;
+
+	double lambda = L, lambdaP, iterLimit = 100;
+	do
+	{
+		double sinLambda = sin(lambda), cosLambda = cos(lambda);
+		sinSigma = sqrt((cosU2*sinLambda)*(cosU2*sinLambda)+ (cosU1*sinU2 - sinU1*cosU2*cosLambda)*(cosU1*sinU2 - sinU1*cosU2*cosLambda));
+
+		if (sinSigma == 0)
+		{
+			return 0;
+		}
+
+		cosSigma = sinU1*sinU2 + cosU1*cosU2*cosLambda;
+		sigma = atan2(sinSigma, cosSigma);
+		double sinAlpha = cosU1*cosU2*sinLambda/sinSigma;
+		cosSqAlpha = 1 - sinAlpha*sinAlpha;
+		cos2SigmaM = cosSigma - 2*sinU1*sinU2/cosSqAlpha;
+
+		double C = f/16*cosSqAlpha*(4 + f*(4 - 3*cosSqAlpha));
+		lambdaP = lambda;
+		lambda = L + (1 - C)*f*sinAlpha*(sigma + C*sinSigma*(cos2SigmaM + C*cosSigma*(-1 + 2*cos2SigmaM*cos2SigmaM)));
+	} while (abs(lambda - lambdaP) > 1e-12 && --iterLimit > 0);
+
+	if (iterLimit == 0)
+	{
+		return 0;
+	}
+
+	double uSq = cosSqAlpha*(a*a - b*b)/(b*b);
+	double A = 1 + uSq/16384*(4096 + uSq*(-768 + uSq*(320 - 175*uSq)));
+	double B = uSq/1024*(256 + uSq*(-128 + uSq*(74 - 47*uSq)));
+	double deltaSigma = B*sinSigma*(cos2SigmaM+B/4*(cosSigma*(-1+2*cos2SigmaM*cos2SigmaM)-B/6*cos2SigmaM*(-3+4*sinSigma*sinSigma)*(-3+4*cos2SigmaM*cos2SigmaM)));
+
+	double s = b*A*(sigma - deltaSigma);
+
+	return s;
+}
+
+static int handle_gpsinfo(_unused struct ubus_context *ubusctx, _unused struct ubus_object *obj,
+		_unused struct ubus_request_data *req, _unused const char *method,_unused struct blob_attr *msg)
+{
+
+	blob_buf_init(&b, 0);
+	add_gpsinfo_to_blob(&b);
+	ubus_send_reply(gps_ubus_ctx, req, b.head);
+
+	return 0;
+}
+
+enum {
+	GPSMODE_ATTR_MODE,
+	GPSMODE_ATTR_MAX,
+};
+
+static const struct blobmsg_policy gpsmode_attrs[GPSMODE_ATTR_MAX] = {
+	[GPSMODE_ATTR_MODE]  = { .name = "mode",  .type = BLOBMSG_TYPE_STRING },
+};
+
+static int handle_gpsmode(_unused struct ubus_context *ubusctx, _unused struct ubus_object *obj,
+		_unused struct ubus_request_data *req, _unused const char *method,_unused struct blob_attr *msg)
+{
+	struct blob_attr *tb[GPSMODE_ATTR_MAX];
+	blob_buf_init(&b, 0);
+
+	blobmsg_parse(gpsmode_attrs, GPSMODE_ATTR_MAX, tb, blob_data(msg), blob_len(msg));
+	if (tb[GPSMODE_ATTR_MODE]) {
+		char *gmode = blobmsg_get_string(tb[GPSMODE_ATTR_MODE]);
+
+		if (work_mode == UART_TYPE) {
+			if (!strcmp(gmode, "GP"))
+				write(gps_fd, "$CCSIR,2,0*4A\r\n", 15); //gps
+			else if (!strcmp(gmode, "BD"))
+				write(gps_fd, "$CCSIR,1,0*49\r\n", 15); //bd
+			else if (!strcmp(gmode, "GN"))
+				write(gps_fd, "$CCSIR,3,0*4B\r\n", 15); //bd+gps
+			else {
+				blobmsg_add_string(&b, "result", "false");
+				goto out;
+			}
+		}else {
+			if (!strcmp(gmode, "GP"))
+				write_i2c_page(gps_fd, GPS_SLAVE_ADDR, 0x00, "$CCSIR,2,0*4A\r\n", 15); //gps
+			else if (!strcmp(gmode, "BD"))
+				write_i2c_page(gps_fd, GPS_SLAVE_ADDR, 0x00, "$CCSIR,1,0*49\r\n", 15); //bd
+			else if (!strcmp(gmode, "GN"))
+				write_i2c_page(gps_fd, GPS_SLAVE_ADDR, 0x00, "$CCSIR,3,0*4B\r\n", 15); //bd+gps
+			else {
+				blobmsg_add_string(&b, "result", "false");
+				goto out;
+			}
+		}
+	}
+
+	blobmsg_add_string(&b, "result", "true");
+out:
+	ubus_send_reply(gps_ubus_ctx, req, b.head);
+
+	return 0;
+}
+
+enum {
+	GPSDATA_ATTR_MODE,
+	GPSDATA_ATTR_MAX,
+};
+
+static const struct blobmsg_policy gpsdata_attrs[GPSDATA_ATTR_MAX] = {
+	[GPSDATA_ATTR_MODE]  = { .name = "operate",  .type = BLOBMSG_TYPE_INT32 },
+};
+
+static int handle_gpsdata(_unused struct ubus_context *ubusctx, _unused struct ubus_object *obj,
+		_unused struct ubus_request_data *req, _unused const char *method,_unused struct blob_attr *msg)
+{
+	struct blob_attr *tb[GPSDATA_ATTR_MAX];
+	blob_buf_init(&b, 0);
+	int ret;
+
+	blobmsg_parse(gpsdata_attrs, GPSDATA_ATTR_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (tb[GPSDATA_ATTR_MODE]) {
+		ret = blobmsg_get_u32(tb[GPSDATA_ATTR_MODE]);
+		if (ret == 0)
+			gpslog.status = GPS_SER_CLOSE;
+		else if (ret == 1)
+			gpslog.status = GPS_SER_OPEN;
+	}
+
+	blobmsg_add_string(&b, "result", "true");
+	ubus_send_reply(gps_ubus_ctx, req, b.head);
+	return 0;
+}
+
+enum {
+	GLOGOPEN_FILENAME_ATTR_MODE,
+	GLOGOPEN_SIZE_ATTR_MODE,
+	GLOGOPEN_ATTR_MAX
+};
+
+static const struct blobmsg_policy glogopen_attrs[GLOGOPEN_ATTR_MAX] = {
+	[GLOGOPEN_FILENAME_ATTR_MODE]  = { .name = "filename",  .type = BLOBMSG_TYPE_STRING },
+	[GLOGOPEN_SIZE_ATTR_MODE]  = { .name = "size",  .type = BLOBMSG_TYPE_INT32 },
+};
+
+static int handle_glogopen(_unused struct ubus_context *ubusctx, _unused struct ubus_object *obj,
+		_unused struct ubus_request_data *req, _unused const char *method,_unused struct blob_attr *msg)
+{
+	const char *uci_value = NULL;
+	struct blob_attr *tb[GLOGOPEN_ATTR_MAX];
+	blob_buf_init(&b, 0);
+
+	uci_value = uci_get_option(ctx, "fstab", "current", "path");
+	blobmsg_parse(glogopen_attrs, GLOGOPEN_ATTR_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (NULL == gpslog.gps_fp) {
+		if (tb[GLOGOPEN_FILENAME_ATTR_MODE] && tb[GLOGOPEN_SIZE_ATTR_MODE]) {
+			char *str = blobmsg_get_string(tb[GLOGOPEN_FILENAME_ATTR_MODE]);
+			snprintf(gpslog.filename, sizeof(gpslog.filename),"%s", str);
+			if (uci_value)
+				snprintf(gpslog.backfile, sizeof(gpslog.backfile),"%s/%s", uci_value, "gpsback.log");
+			gpslog.filesize = blobmsg_get_u32(tb[GLOGOPEN_SIZE_ATTR_MODE]);
+
+			gpslog.gps_fp = fopen(gpslog.filename, "at+");
+			if (NULL == gpslog.gps_fp) {
+				gpslog.status = GPS_LOG_CLOSE;
+				blobmsg_add_string(&b, "result", "false");
+				goto out;
+			}
+			gpslog.status = GPS_LOG_OPEN;
+		}else {
+			blobmsg_add_string(&b, "result", "false");
+			goto out;
+		}
+
+	}else {
+		blobmsg_add_string(&b, "result", "false");
+		goto out;
+	}
+
+	blobmsg_add_string(&b, "result", "true");
+out:
+	ubus_send_reply(gps_ubus_ctx, req, b.head);
+	return 0;
+}
+
+static int handle_glogclose(_unused struct ubus_context *ctx, _unused struct ubus_object *obj,
+		_unused struct ubus_request_data *req, _unused const char *method,_unused struct blob_attr *msg)
+{
+	blob_buf_init(&b, 0);
+
+	if (gpslog.gps_fp)
+		fclose(gpslog.gps_fp);
+	gpslog.gps_fp = NULL;
+
+	gpslog.status = GPS_LOG_CLOSE;
+
+	blobmsg_add_string(&b, "result", "true");
+	ubus_send_reply(ctx, req, b.head);
+
+	return 0;
+}
+
+enum {
+	DISTANCE_FLAT_ATTR_MODE,
+	DISTANCE_FLON_ATTR_MODE,
+	DISTANCE_ELAT_ATTR_MODE,
+	DISTANCE_ELON_ATTR_MODE,
+	DISTANCE_ATTR_MAX
+};
+
+static const struct blobmsg_policy distance_attrs[DISTANCE_ATTR_MAX] = {
+	[DISTANCE_FLAT_ATTR_MODE]  = { .name = "lat1",  .type = BLOBMSG_TYPE_STRING },
+	[DISTANCE_FLON_ATTR_MODE]  = { .name = "lon1",  .type = BLOBMSG_TYPE_STRING },
+	[DISTANCE_ELAT_ATTR_MODE]  = { .name = "lat2",  .type = BLOBMSG_TYPE_STRING },
+	[DISTANCE_ELON_ATTR_MODE]  = { .name = "lon2",  .type = BLOBMSG_TYPE_STRING },
+};
+
+static int handle_distance(_unused struct ubus_context *ctx, _unused struct ubus_object *obj,
+		_unused struct ubus_request_data *req, _unused const char *method,_unused struct blob_attr *msg)
+{
+	double flat = 0.0, flon = 0.0, elat = 0.0, elon = 0.0;
+	double distance = 0.0;
+	char value[15] = {0};
+	struct blob_attr *tb[DISTANCE_ATTR_MAX];
+	blob_buf_init(&b, 0);
+
+	blobmsg_parse(distance_attrs, DISTANCE_ATTR_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (tb[DISTANCE_FLAT_ATTR_MODE]) {
+		char *lat1 = blobmsg_get_string(tb[DISTANCE_FLAT_ATTR_MODE]);
+		flat = strtod(lat1, NULL);
+	}
+	if (tb[DISTANCE_FLON_ATTR_MODE]) {
+		char *lon1 = blobmsg_get_string(tb[DISTANCE_FLON_ATTR_MODE]);
+		flon = strtod(lon1, NULL);
+	}
+	if (tb[DISTANCE_ELAT_ATTR_MODE]) {
+		char *lat2 = blobmsg_get_string(tb[DISTANCE_ELAT_ATTR_MODE]);
+		elat = strtod(lat2, NULL);
+	}
+	if (tb[DISTANCE_ELON_ATTR_MODE]) {
+		char *lon2 = blobmsg_get_string(tb[DISTANCE_ELON_ATTR_MODE]);
+		elon = strtod(lon2, NULL);
+	}
+
+	distance = getdistance(flat, flon, elat, elon);
+	snprintf(value, sizeof(value), "%lf", distance);
+
+	blobmsg_add_string(&b, "distance", value);
+	ubus_send_reply(ctx, req, b.head);
+
+	return 0;
+}
+
+enum {
+	GSTAND_PATH_ATTR_MODE,
+	GSTAND_ATTR_MAX
+};
+
+static const struct blobmsg_policy gstand_attrs[GSTAND_ATTR_MAX] = {
+	[GSTAND_PATH_ATTR_MODE]  = { .name = "path",  .type = BLOBMSG_TYPE_STRING },
+};
+
+static int handle_gstand(_unused struct ubus_context *ubusctx, _unused struct ubus_object *obj,
+		_unused struct ubus_request_data *req, _unused const char *method,_unused struct blob_attr *msg)
+{
+	bool ret = false;
+	struct blob_attr *tb[GSTAND_ATTR_MAX];
+	blob_buf_init(&b, 0);
+
+	blobmsg_parse(gstand_attrs, GSTAND_ATTR_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (tb[GSTAND_PATH_ATTR_MODE]) {
+		char *path = blobmsg_get_string(tb[GSTAND_PATH_ATTR_MODE]);
+		strcpy(gps_msg.path, path);
+		ret = true;
+	}
+
+	stand_flag = 1;
+
+	blobmsg_add_u8(&b, "result", ret);
+	ubus_send_reply(gps_ubus_ctx, req, b.head);
+
+	return 0;
+}
+
+static struct ubus_method gps_object_methods[] = {
+	UBUS_METHOD_NOARG("gpsinfo", handle_gpsinfo),
+	UBUS_METHOD("gpsmode", handle_gpsmode, gpsmode_attrs),
+	UBUS_METHOD("gpsdata", handle_gpsdata, gpsdata_attrs),
+	UBUS_METHOD("glogopen", handle_glogopen, glogopen_attrs),
+	UBUS_METHOD_NOARG("glogclose", handle_glogclose),
+	UBUS_METHOD("distance", handle_distance, distance_attrs),
+	UBUS_METHOD("gstand", handle_gstand, gstand_attrs),
+};
+
+static struct ubus_object_type gps_object_type =
+UBUS_OBJECT_TYPE("gpsd", gps_object_methods);
+
+static struct ubus_object gps_object = {
+	.name = "gpsd",
+	.type = &gps_object_type,
+	.methods = gps_object_methods,
+	.n_methods = ARRAY_MSG_SIZE(gps_object_methods),
+};
+
+static void ubus_connect_handler(struct ubus_context *ctx)
+{
+	gps_ubus_ctx = ctx;
+
+	ubus_add_uloop(gps_ubus_ctx);
+	ubus_add_object(gps_ubus_ctx, &gps_object);
+
+	return;
+}
+
+static void gps_operate_timer_cb (struct uloop_timeout *t)
+{
+	if (work_mode == I2C_TYPE)
+		main_loop(gps_fd);
+	else if (work_mode == OTHER_TYPE)
+		other_loop(gps_fp);
+
+	uloop_timeout_set(t, FREQUENCY);
+}
+
+static int gps_ubus_init(void)
+{
+	conn.cb = ubus_connect_handler;
+	ubus_auto_connect(&conn);
+
+	if ((work_mode == I2C_TYPE) || (work_mode == OTHER_TYPE)) {
+		gps_operate_timer.cb = gps_operate_timer_cb;
+		uloop_timeout_set(&gps_operate_timer, FREQUENCY);
+	}
+
+	return 0;
+}
+
+static void gps_read_cb (struct uloop_fd *fd, unsigned int event)
+{
+	int ret;
+
+	ret = handle_nmea_msg(fd->fd, gbuf);
+
+	if (ret < 0) {
+		glog(LOG_ERR, "Failed to read gps msg: %s\n", strerror(errno));
+	}
+}
+
+static int gps_operate_init()
+{
+	gps_ubus_fd.fd = gps_fd;
+    gps_ubus_fd.cb = gps_read_cb;
+	uloop_fd_add(&gps_ubus_fd,ULOOP_READ);
+
+	return 0;
+}
+
+static int gps_init()
+{
+	if (uloop_init() != 0) {
+		glog(LOG_ERR, "initialize the uloop error!\n");
+		return -1;
+	}
+
+	if (work_mode == UART_TYPE) {
+		if (gps_operate_init() != 0) {
+			glog(LOG_ERR, "gps_operate_init error!\n");
+			return -1;
+		}
+
+		//open gps antenna
+		//write(gps_fd, "$CCMSG,TXT,1,1,*01\r\n", 20);
+	}
+
+	if (gps_ubus_init() != 0 ) {
+		glog(LOG_ERR, "gps_ubus_init error\n");
+		return -1;
+	}
+
+	uloop_run();
+	return 0;
+}
+
+static void usage(void)
+{
+	fprintf(stderr,
+			"option: \n"
+			"       -d device [uart:device=/dev/softuart  i2c:deivce=/dev/i2c-0]\n"
+			"       -v show more debug messages (-vv for even more)\n"
+			"       -i choose i2c operation\n"
+			"       -u choose uart operation\n"
+			"       -h show this usage\n");
+	exit(1);
+}
+
+int main(int argc, char *argv[])
+{
+	int opt, i;
+	int daemon = 0;
+	const char *device = NULL;
+
+	while ((opt = getopt(argc, argv, "d:c:h:vuio")) != -1) {
+		switch (opt) {
+			case 'd':
+				device = optarg;
+				break;
+			case 'c':
+				devctl = optarg;
+				break;
+			case 's':
+				set_time = 1;
+				break;
+			case 'v':
+				verbose++;
+				break;
+			case 'i':
+				work_mode = 1;
+				break;
+			case 'u':
+				work_mode = 0;
+				break;
+			case 'o':
+				work_mode = 2;
+				break;
+			case 'D':
+				daemon = 1;
+				break;
+			case 'h':
+				usage();
+				break;
+			default:
+				usage();
+				break;
+		}
+	}
+
+	if (device == NULL)
+		usage();
+
+	if (daemon) {
+		daemonize();
+		openlog(LOG_TAG, LOG_PID, LOG_DAEMON);
+		use_syslog = 1;
+	}
+
+	setup_signals();
+	gpslog.status = GPS_LOG_CLOSE;
+
+	ctx = uci_init();
+	if (ctx == NULL)
+		return -1;
+
+	gbuf = gps_buf_alloc(GPS_BUFSZ);
+	if (gbuf == NULL) {
+		glog(LOG_ERR, "Out of memory");
+		return -1;
+	}
+
+	if (work_mode == OTHER_TYPE) {
+		gps_fp = fopen(device, "r");	
+		if (gps_fp == NULL) {
+			glog(LOG_DEBUG, "fopen device fail!\n");
+			exit(1);
+		}
+	}else {
+		gps_fd = open(device, O_RDWR);
+		if (gps_fd < 0) {
+			glog(LOG_DEBUG, "open device fail!\n");
+			exit(1);
+		}
+	}
+
+	if (work_mode == I2C_TYPE) {
+		ioctl(gps_fd, I2C_SLAVE, GPS_SLAVE_ADDR);
+
+		for (i = 0; i < ARRAY_MSG_SIZE(comms); i++)
+			write_i2c_page(gps_fd, GPS_SLAVE_ADDR, 0x00, comms[i].command, 12);
+	}
+
+	if (gps_init() != 0)
+		goto out;
+
+	
+	if (work_mode == OTHER_TYPE) {
+		fclose(gps_fp);
+		gps_fp = NULL;
+	}else {
+		tcsetattr(gps_fd, TCSAFLUSH, &tiosfd);
+		close(gps_fd);
+	}
+
+//	gps_buf_free(gbuf);
+
+	if (ctx)
+		uci_free_context(ctx);
+
+	if (use_syslog)
+		closelog();
+
+#ifdef HAVE_GPS_LED
+	led_gps(0);
+#endif
+
+out :
+	destroy_all();
+
+	return 0;
+}
