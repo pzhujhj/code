@@ -27,7 +27,7 @@ int main(int argc, char *argv[])
 {
 	char buf[128] = {0};
 
-	/"调用系统命令的时候,添加上2>&1才会把错误信息输入到buf中"/
+	/*调用系统命令的时候,添加上2>&1才会把错误信息输入到buf中*/
 	popen_cmd("ls -lh 5.txt 2>&1", buf, sizeof(buf));
 	printf("buf=%s\n", buf);
 	return 0;
