@@ -21,11 +21,12 @@ char *myStrstr(char const *src, char const *target)
 
 int main()
 {
-	char buf[64] = "abctt45bcdffdbci";
+	char buf[64] = "gz_test:id:7000028";
 	char *p = NULL;
 
-	p = myStrstr(buf, "df");
+	p = myStrstr(buf, ":");//返回的肯能是一个空值，所以在使用p的时候需要做判断
 
-	printf("p=%s\n", p);
+	if (p)
+		printf("p=%s\n", p+1);
 	return 0;
 }
