@@ -109,7 +109,8 @@ int hexTostr(char *hexc, char *str)
 int main()
 {
 	//char msg[] = "hell34w";
-	char msg[] = "h";
+	//char msg[] = "170520";
+	char msg[] = "";
 	char hex[128] = {0};
 	char str[128] = {0};
 
