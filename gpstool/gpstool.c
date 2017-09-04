@@ -952,9 +952,10 @@ void init_sigaction(void)
 	act.sa_flags=0;
 	sigemptyset(&act.sa_mask);
 
-	sigaction(SIGALRM,&act,NULL);
+	sigaction(SIGALRM,&act,NULL); //SIGALRM 用于定时器的信号
 }
 
+/*定时器的使用*/
 void set_timer(void)
 {
 	struct itimerval itv;
@@ -971,10 +972,8 @@ static void usage(void)
 {
 	fprintf(stderr,
 			"option: \n"
-			"       -d device [uart:device=/dev/softuart  i2c:deivce=/dev/i2c-0]\n"
+			"       -d file path\n"
 			"       -v show more debug messages (-vv for even more)\n"
-			"       -i choose i2c operation\n"
-			"       -u choose uart operation\n"
 			"       -h show this usage\n");
 	exit(1);
 }
