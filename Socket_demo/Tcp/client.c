@@ -15,6 +15,8 @@
 
 #include "debug.h"
 
+#define MAX(x,y) (x)>(y)?(x):(y)
+
 static void print_help(char **argv)
 {
 	printf("%s usage:\n"
@@ -28,13 +30,29 @@ static void print_help(char **argv)
 static void str_cli(FILE *fp, int clifd)
 {
 	char sendline[512], recvline[512];
+	int maxfd;
+	fd_set rset;
 
-	while(fgets(sendline, 512, fp) != NULL) {
-		write(clifd, sendline, 512);
-		if (read(clifd, recvline, 512) == 0)
-			printf("recv over!\n");
+	FD_ZERO(&rset);
 
-		fputs(recvline, stdout);
+	for(;;) {
+		FD_SET(fileno(fp), &rset);
+		FD_SET(clifd, &rset);
+
+		maxfd = MAX(fileno(fp), clifd) + 1;
+		select(maxfd, &rset, NULL, NULL, NULL);
+
+		if(FD_ISSET(clifd, &rset)) {
+			if(read(clifd, recvline, 512) == 0)
+				printf("recv over!\n");
+			fputs(recvline, stdout);
+		}
+
+		if(FD_ISSET(fileno(fp), &rset)) {
+			if(fgets(sendline, 512, fp) == NULL)
+				return;
+			write(clifd, sendline, 512);
+		}
 	}
 
 }

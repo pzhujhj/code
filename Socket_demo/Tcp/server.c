@@ -105,6 +105,7 @@ err:
 	return -1;
 }
 
+#if 0
 static void str_echo(int sockfd)
 {
 	ssize_t n;
@@ -138,13 +139,17 @@ static void init_sigaction(void)
 
 	sigaction(SIGCHLD, &act, NULL);
 }
+#endif
 
 int main(int argc, char **argv)
 {
-	int sockfd, connfd;
+	int sockfd, connfd, maxfd, maxi, i, readfd;
 	socklen_t clilen;
-	pid_t childpid;
+	//pid_t childpid;
 	struct sockaddr_in cliaddr;
+	int client[MAX_CLIENT], nready, n;
+	fd_set rset, allset;
+	char buf[512] = {0};
 
 	if (argc > 1)
 		parameter_parser(argc, argv);
@@ -154,6 +159,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
+#if 0
 	//处理client端输入EOF(ctrl+d)后导致服务端子进程成为僵尸进程,所以通过信号处理,但是这个处理方式不很好
 	init_sigaction();
 
@@ -172,6 +178,75 @@ int main(int argc, char **argv)
 		}
 
 		close(connfd);
+	}
+#endif
+
+	maxfd = sockfd;
+	maxi = -1; //index into client[] array
+
+	for(i = 0; i < MAX_CLIENT; i++) 
+		client[i] = -1;
+
+	FD_ZERO(&allset);
+	FD_SET(sockfd, &allset);
+
+	for(;;) {
+		rset = allset;
+		nready = select(maxfd+1, &rset, NULL, NULL, NULL);//返回成功表示文件描述符状态该改变的的个数
+		if (nready < 0) {
+			debug(MSG_ERROR, "select error!");
+			exit(1);
+		}
+
+		if(FD_ISSET(sockfd, &rset)) {//new client connection
+			clilen = sizeof(cliaddr);
+			if((connfd = accept(sockfd, (struct sockaddr*)&cliaddr, &clilen)) < 0) {
+				debug(MSG_ERROR, "accept error!");
+				exit(1);
+			}
+
+			debug(MSG_CRIT, "new client: %s, port %d", inet_ntoa(cliaddr.sin_addr), ntohs(cliaddr.sin_port));
+
+			for(i = 0; i < MAX_CLIENT; i++) {
+				if(client[i] < 0) {
+					client[i] = connfd; //save descriptor
+					break;
+				}				
+			}
+
+			if(i == MAX_CLIENT) {
+				debug(MSG_ERROR, "too many clients!");
+				continue;
+			}
+
+			FD_SET(connfd, &allset); //add new descriptor to set
+			if(connfd > maxfd)
+				maxfd = connfd;
+
+			if(i > maxi)
+				maxi = i;
+
+			if (--nready <= 0)
+				continue; // no more readable descriptors
+		}
+
+		memset(buf, 0, sizeof(buf));
+		for (i = 0; i <= maxi; i++) {//check all clients for data
+			if ((readfd = client[i]) < 0)
+				continue;
+			if(FD_ISSET(readfd, &rset)) {
+				if((n = read(readfd, buf, 512)) == 0) {
+					//connection closed by client
+					close(readfd);
+					FD_CLR(readfd, &allset);
+					client[i] = -1;
+				}else 
+					write(readfd, buf, n);
+			}
+
+			if(--nready <= 0)
+				break;
+		}
 	}
 
 	close(sockfd);
