@@ -12,7 +12,6 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-
 #include "debug.h"
 
 #define MAX(x,y) (x)>(y)?(x):(y)
