@@ -244,8 +244,8 @@ int main(int argc, char **argv)
 					write(readfd, buf, n);
 			}
 
-			if(--nready <= 0)
-				break;
+			//if(--nready <= 0)
+			//	break;
 		}
 	}
 
