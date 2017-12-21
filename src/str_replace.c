@@ -14,8 +14,10 @@ static char *str_replace(const char *src, const char *matchstr, const char *repl
 	char *value = malloc(size);
 	char *dst = value; //dst作为操作指针,value作为存放数据的指针
 
-	if((NULL == matchstr) || (NULL == replacestr))
+	if((strlen(src) == 0) || (strlen(matchstr)==0) || (0 == strlen(replacestr))) {
+		free(value);
 		return NULL;
+	}
 
 	if ( value != NULL ) {
 		for ( ;; ) {
@@ -62,11 +64,14 @@ static char *str_replace(const char *src, const char *matchstr, const char *repl
 int main()
 {
 	char *data;
-	char buf[] = "-1112r2223,445";
-	//for(;;) {
+	char buf[] = "33333-444";
+//	for(;;) {
 		data = str_replace(buf,"-",":");	
-		printf("%s\n",data);
-		free(data);
-	//}
+		if (data) {
+			printf("%s\n",data);
+			free(data);
+		}
+
+//	}
 	return 0;
 }
