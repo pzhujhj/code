@@ -1,0 +1,31 @@
+1、在.c文件中定义宏
+#define TEST 1
+使用#if方式：
+#if TEST
+	TEST为1走这个分支
+#else
+	TEST为0走这个分支
+#endif
+
+使用#ifdef方式:
+#ifdef TEST
+	不管TEST等于多少，只要#define TEST都运行这个分支
+#else
+
+#endif
+2、在Makefile中定义宏
+DEFS = -DTEST (默认TEST=1,如果想设置为0可以DEFS = -DTEST=0)
+
+使用#if方式：
+#if TEST
+	TEST为1走这个分支
+#else
+	TEST为0走这个分支
+#endif
+
+使用#ifdef方式:
+#ifdef TEST
+	不管TEST等于多少，只要Makefile中定义DEFS = -DTEST都运行这个分支
+#else
+
+#endif
