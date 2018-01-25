@@ -41,13 +41,14 @@ int main()
 	printf("two: type=%d len=%d value=%s\n", ttwo->type, ttwo->len, ttwo->value);
 	free(ttwo);
 	
-#if 0
+#if 1
 	tfour = (TEST_FOUR *)malloc(sizeof(TEST_FOUR));
 	tfour->type = 2;
 	tfour->len = 2;
 	tfour->value = malloc(sizeof(char)*size);
 	strcpy(tfour->value, "aaaaa");
 	printf("four: type=%d len=%d value=%s\n", tfour->type, tfour->len, tfour->value);
+	printf("%p %p %p\n", &tfour->type, &tfour->len, tfour->value);
 	free(tfour->value);
 	free(tfour);
 #else
@@ -57,6 +58,7 @@ int main()
 	tfour->value = ((char *)tfour) + sizeof(TEST_FOUR);
 	strcpy(tfour->value, "bbbb");
 	printf("four: type=%d len=%d value=%s\n", tfour->type, tfour->len, tfour->value);
+	printf("%p %p %p\n", &tfour->type, &tfour->len, tfour->value);
 	free(tfour);
 #endif	
 	
