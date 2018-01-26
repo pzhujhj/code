@@ -13,6 +13,7 @@
 #include <fcntl.h>
 
 #include "debug.h"
+#include "message.h"
 
 #define MAX(x,y) (x)>(y)?(x):(y)
 
@@ -56,12 +57,63 @@ static void str_cli(FILE *fp, int clifd)
 
 }
 
+static int send_client_msg(int clifd)
+{
+	int readn;
+	char rcvbuf[BUFSIZE] = {0}, sendbuf[BUFSIZE] = {0};
+	MSGSTR *msgstr;
+
+	memset(rcvbuf, 0, BUFSIZE);
+	readn = read(clifd, rcvbuf, BUFSIZE);
+	debug(MSG_CRIT, "rcvbuf=%s", rcvbuf);
+
+#if 0  //method one
+	msgstr  = (MSGSTR *)malloc(sizeof(MSGSTR));
+	msgstr->number = 1;
+	strcpy(msgstr->value, "hello");
+	write(clifd, msgstr, sizeof(MSGSTR));
+	free(msgstr);
+#endif
+
+#if 0 //method two error
+	int size = 128;
+	char buf[BUFSIZE] = {0};
+	msgstr  = (MSGSTR *)malloc(sizeof(MSGSTR));
+	msgstr->number = 2;
+	msgstr->value = malloc(sizeof(char)*size);
+	//msgstr->value = ((char *)msgstr) + sizeof(MSGSTR);
+	strcpy(msgstr->value, "wwwwww");
+	memcpy(buf, msgstr, BUFSIZE);
+	//write(clifd, msgstr, sizeof(MSGSTR));
+	printf("%p %p\n", &msgstr->number, msgstr->value);
+	write(clifd, buf, BUFSIZE);
+	free(msgstr->value);
+	free(msgstr);
+#endif
+
+#if 1 //method three
+	int mlen;
+	char buf[] = "fdfdfd";
+	mlen = strlen(buf);
+	msgstr  = (MSGSTR *)malloc(sizeof(MSGSTR) + sizeof(char)*mlen);
+	msgstr->type = htonl(3);
+	msgstr->len = htonl(mlen);
+	strncpy(msgstr->value, buf, mlen);
+	printf("%p %p %p\n", &msgstr->type, &msgstr->len, msgstr->value);
+	write(clifd, msgstr, sizeof(MSGSTR) + sizeof(char)*mlen);
+	free(msgstr);
+#endif
+
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
-	int clifd;
+	int clifd, ret;
 	struct sockaddr_in addr;
+	int time = 5;
 
-	if (argc < 2)
+	if (argc < 5)
 		print_help(argv);
 
 	if ((clifd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -71,14 +123,18 @@ int main(int argc, char **argv)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
-	addr.sin_port = htons(atoi(argv[2]));
-	if (inet_pton(AF_INET, argv[1], &addr.sin_addr.s_addr) <= 0) {
+	addr.sin_port = htons(atoi(argv[4]));
+	if (inet_pton(AF_INET, argv[2], &addr.sin_addr.s_addr) <= 0) {
 		debug(MSG_ERROR, "servip invalid!");
 		exit(1);
 	}
 
 	connect(clifd, (struct sockaddr *)&addr, sizeof(addr));
-	str_cli(stdin, clifd);
+	//str_cli(stdin, clifd);
+
+	do {
+		ret = send_client_msg(clifd);
+	}while((ret == 1) && (time--));
 	
 	close(clifd);
 	return 0;

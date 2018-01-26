@@ -15,6 +15,7 @@
 #include <fcntl.h>
 
 #include "debug.h"
+#include "message.h"
 
 #define DEFAULT_SERVER_IP "0.0.0.0"
 #define DEFAULT_SERVER_PORT 9999
@@ -98,7 +99,7 @@ static int open_tcp_socket(char *servip, unsigned short servport)
 		debug(MSG_ERROR, "listen socket error!");
 		goto err;
 	}
-	
+
 	return serverfd;
 err:
 	close(serverfd);
@@ -141,6 +142,96 @@ static void init_sigaction(void)
 }
 #endif
 
+static int readXbytes(int fd, unsigned int x, void* buffer)
+{
+	int bytesread = 0;
+	int readn;
+
+	while (bytesread < x) {
+		readn = read(fd, buffer + bytesread, x - bytesread);
+		if (readn == 0) {
+			debug(MSG_ERROR, "client closed this connection!");
+			return 0;
+		} else if (readn < 0) {
+			debug(MSG_ERROR,"Error, read socket");
+			return -1;
+		}
+
+		bytesread += readn;
+	}
+	return x;
+}
+
+static int handle_request(int fd)
+{
+	int ret, readn;
+	MSGSTR *rmsgstr;
+
+#if 0 //methmod one
+	/*这里用到结构体直接传送数据，也可以将结构体转换成数组进行传送数据*/
+	rmsgstr = (MSGSTR *)malloc(sizeof(MSGSTR));
+	readn = read(fd, rmsgstr, sizeof(MSGSTR));
+	if(readn < 0)
+		debug(MSG_ERROR, "read socket error");
+
+	printf("%p %p\n", &rmsgstr->number, rmsgstr->value);
+	debug(MSG_CRIT, "recv byte:%d msg:%d %s", readn, rmsgstr->number, rmsgstr->value);
+	free(rmsgstr);
+#endif
+
+#if 0 //method two error
+	int size = 128;
+	char buf[BUFSIZE] = {0};
+	readn = read(fd, buf, BUFSIZE);
+	printf("buf=%s\n", buf);
+	rmsgstr = (MSGSTR *)malloc(sizeof(MSGSTR));
+	memcpy(rmsgstr, buf, sizeof(rmsgstr));
+	rmsgstr->value = malloc(sizeof(char)*size);
+	//readn = read(fd, rmsgstr, sizeof(MSGSTR));
+	//if(readn < 0)
+	//	debug(MSG_ERROR, "read socket error");
+
+	printf("%p %p\n", &rmsgstr->number, rmsgstr->value);
+
+	debug(MSG_CRIT, "recv byte:%d msg:%d %s", readn, rmsgstr->number, rmsgstr->value);
+	
+	free(rmsgstr->value);
+	free(rmsgstr);	
+#endif
+
+#if 1 //method three
+	unsigned int type;
+	unsigned int len;
+	if((ret = readXbytes(fd, sizeof(type), (void *)&type)) <= 0) {
+		debug(MSG_ERROR, "read type error!");
+		return ret;
+	}
+	type = ntohl(type);
+
+	if((ret = readXbytes(fd, sizeof(len), (void *)&len)) <= 0) {
+		debug(MSG_ERROR, "read type error!");
+		return ret;
+	}
+	len = ntohl(len);
+
+	rmsgstr = (MSGSTR *)malloc(sizeof(MSGSTR) + sizeof(char)*len);
+	rmsgstr->type = type;
+	rmsgstr->len = len;
+	
+	if (len > 0 && (ret = readXbytes(fd, rmsgstr->len, (void *)(rmsgstr->value))) <= 0) {
+		free(rmsgstr);
+		return ret;
+	}	
+
+	printf("%p %p %p\n", &rmsgstr->type, &rmsgstr->len, rmsgstr->value);
+	debug(MSG_CRIT, "recv msg:%d %d %s", rmsgstr->type, rmsgstr->len, rmsgstr->value);
+
+	free(rmsgstr);
+
+#endif
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	int sockfd, connfd, maxfd, maxi, i, readfd;
@@ -149,7 +240,8 @@ int main(int argc, char **argv)
 	struct sockaddr_in cliaddr;
 	int client[MAX_CLIENT], nready, n;
 	fd_set rset, allset;
-	char buf[512] = {0};
+	char buf[BUFSIZE] = {0};
+	MSGSTR *smsgstr;
 
 	if (argc > 1)
 		parameter_parser(argc, argv);
@@ -226,8 +318,14 @@ int main(int argc, char **argv)
 			if(i > maxi)
 				maxi = i;
 
+			//send message to new client
+			memset(buf, 0, BUFSIZE);
+			snprintf(buf, BUFSIZE, "you id:%d", i);
+			write(connfd, buf, strlen(buf));
+
 			if (--nready <= 0)
 				continue; // no more readable descriptors
+
 		}
 
 		memset(buf, 0, sizeof(buf));
@@ -235,6 +333,7 @@ int main(int argc, char **argv)
 			if ((readfd = client[i]) < 0)
 				continue;
 			if(FD_ISSET(readfd, &rset)) {
+				#if 0
 				if((n = read(readfd, buf, 512)) == 0) {
 					//connection closed by client
 					close(readfd);
@@ -242,10 +341,17 @@ int main(int argc, char **argv)
 					client[i] = -1;
 				}else 
 					write(readfd, buf, n);
-			}
+				#endif
 
-			//if(--nready <= 0)
-			//	break;
+				if(handle_request(readfd) <= 0) {
+					FD_CLR(readfd, &allset);
+					close(readfd);
+					client[i] = -1;
+				}
+
+				if(--nready <= 0)
+					break;				
+			}
 		}
 	}
 

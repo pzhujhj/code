@@ -1,0 +1,28 @@
+1、这是一个简单的socket tcp通信例子，模拟一个服务端接收多个客户端，服务端处理的方式是select，后续补上线程方式
+2、客户端和服务端通过结构体封装数据进行发送
+(1)第一种方式
+typedef struct _msgstr {
+	int number;
+	char value[32];
+}MSGSTR;
+这个可以通过write直接操作结构体，然后read直接操作结构体，也可以先把结构体转换成数组buf，在write，接收的时候将数组buf转换成结构体
+(2)第二种方式
+typedef struct _msgstr {
+	int number;
+	char *value;
+}MSGSTR;
+这个方式通过socket发送还有问题，这个问题的参考:http://blog.csdn.net/laoyang360/article/details/47342541
+(3)第三种方式
+typedef struct _msgstr {
+	unsigned int type;
+	unsigned int len;
+	char value[0];
+}MSGSTR;
+这就是通常使用的tlv方式，需要注意的是，接收这样的数据通过封装的readXbytes进行接收，这样能保证数据能正确接收完整。
+3、传送数据时注意使用htonl(htons)和ntohl(ntohs)
+在网络上传输数据时，由于数据传输的两端可能对应不同的硬件平台，采用的存储字节顺序也可能不一致，因此 TCP/IP 协议规定了在网络上必须采用网络字节顺序(也就是大端模式) 。
+通过对大小端的存储原理分析可发现，对于char 型数据，由于其只占一个字节，所以不存在这个问题，这也是一般情况下把数据缓冲区定义成 char 类型 的原因之一。
+对于IP地址、端口号等非 char 型数据，必须在数据发送到网络上之前将其转换成大端模式，在接收到数据之后再将其转换成符合接收端主机的存储模式
+所以short 或者 long的数据在进行通信的时候最好养成：
+发送的时候使用：htons（l）
+接受的时候使用：ntohs（l）
