@@ -136,10 +136,12 @@ int main(int argc, char *argv[])
 }
 #endif
 
+#if 0
 /******************************************************* 
  *方法四：正确使用
- *用static修饰str后，存储的位置由栈区变为静态存储区
+ *在函数体内进行malloc分配内存，然后释放可以
  *直到整个程序运行完才释放
+ *这个方法代码的耦合度增大，调用函数时必须知道内部细节
 *******************************************************/
 static char *popen_cmd(char *cmd)
 {
@@ -167,9 +169,57 @@ int main(int argc, char *argv[])
 {
 	char *p = NULL;
 
-	p = popen_cmd("cat  /home/jihj/mygit/source_code/va_List/1.txt 2>&1");
+	p = popen_cmd("cat  /home/jihj/gitcode/source_code/va_List/1.txt 2>&1");
 	printf("p=%s\n", p);
+
 	free(p); //这里一定要记住释放，防止内存泄露,其实这里的p所指向的地址就是str申请的堆地址,所以释放p就是释放str
 	p = NULL;
 	return 0;
 }
+#endif
+
+/*******************************************************
+ *方法五：正确使用
+ *在函数体外进行malloc分配内存,这种代码耦合度更好
+ *直到整个程序运行完才释放
+*******************************************************/
+static char *popen_cmd(char *cmd, char *str)
+{
+	FILE *fp = NULL;
+
+	fp = popen(cmd, "r");
+	if(fp < 0) {
+		printf("popen error:%s\n", strerror(errno));
+		return NULL;
+	}
+
+	while(fgets(str, 512, fp)) {
+		/*去掉返回值换行符*/
+		if ('\n' == str[strlen(str)-1]) {
+			str[strlen(str)-1] = '\0';
+		}
+	}
+
+	pclose(fp);
+	return str;
+}
+
+int main(int argc, char *argv[])
+{
+	char *p;
+
+	p = malloc(512);
+	if(p == NULL) {
+		printf("malloc error!\n");
+		exit(1);
+	}
+
+	popen_cmd("cat  /home/jihj/gitcode/source_code/va_List/1.txt 2>&1", p);
+	printf("p=%s\n", p);
+
+	free(p);
+	p = NULL;
+
+	return 0;
+}
+
