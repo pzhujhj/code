@@ -1,6 +1,6 @@
 
-# PROGRAM   := a.out    # the executable name
-PROGRAM   := apcheck
+ PROGRAM   := a.out    # the executable name
+#PROGRAM   := apcheck
 
 # SRCDIRS   := .        # current directory
 SRCDIRS   := .
@@ -28,7 +28,7 @@ SOURCES = $(foreach d,$(SRCDIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
 
 #LDFLAGS  += -luci -lucapi -lae_event -ltlv -lnla -pthread
 #LDFLAGS  += -lucapi -lae_event -ltlv -lnla -pthread
-LDFLAGS  += -lae_event -ltlv -lnla -pthread
+LDFLAGS  += -pthread
 
 OBJS 	= main.o 
 #OBJS    = $(foreach x,$(SRCEXTS), \

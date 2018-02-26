@@ -1,12 +1,6 @@
-
-MAKE_OPTS := -C $(LINUX_DIR)
-obj-m += netlink_test.o
-
-#netlink_test-objs := netlink_main.o
-
-
+obj-m := netlink_test.o
+all:
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 clean:
-	rm -rf *.o *.ko .*.cmd *mod.c .tmp_versions
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
 
-compile:
-	+$(MAKE) $(MAKE_OPTS) M=$(CURDIR) modules
